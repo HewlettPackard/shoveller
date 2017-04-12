@@ -1,0 +1,27 @@
+#! /usr/bin/env bash
+set -e
+set -u
+
+SOCKETS=16
+CPUSPER=18
+PAIRSPER=$(($CPUSPER/2))
+
+[[ ! -d oldlogs ]] && \
+    mkdir -v -p oldlogs
+
+mv -vfbu -t oldlogs *.log || true
+
+../../scripts/sysinfo > sysinfo.log
+
+for b in 1024; do
+    for ((s=1; s<=$SOCKETS; s++)); do
+        pairs=$(($s*$PAIRSPER))
+        echo ''; echo ''
+        echo "# run: b $b s $s pairs $pairs"
+        echo "NIBDEBUG=3 ./shuffle $pairs $b"
+        NIBDEBUG=3 ./shuffle $pairs $b \
+            2>&1 | tee -a b.${b}.log
+        sync
+        sleep 10 
+    done
+done

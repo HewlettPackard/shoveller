@@ -1,0 +1,19 @@
+#! /usr/bin/env bash
+set -e
+set -u
+
+export NIBDEBUG=3
+
+scripts/sysinfo 2>&1 | tee -a pipeline.log
+
+for ((pairs=54; pairs<=144; pairs+=9)); do
+    (
+    echo '';echo ''
+    cargo run --bin pipeline_scale --release -- \
+        --min $pairs \
+        --max $pairs \
+        --incr 1 \
+        --size 100 \
+        --cap 600
+    ) 2>&1 | tee -a pipeline.log
+done
