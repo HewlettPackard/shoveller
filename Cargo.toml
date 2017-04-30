@@ -1,6 +1,6 @@
 # http://doc.crates.io/manifest.html
 [package]
-name = "nibble"
+name = "kvs-lsm"
 version = "0.1.0"
 authors = ["Alexander Merritt <merritt.alex@gatech.edu>"]
 
@@ -22,10 +22,22 @@ parking_lot = "0.2.6"
 
 [features]
 default = []
-extern_ycsb = []
-rc = []
-mica = []
+# you generally want to enable this
+# --features "rdrand [others]"
 rdrand = []
+
+# Below features are used only for bin/ycsb.rs and bin/trace.rs
+extern_ycsb = []
+# Access RAMCloud library for bin/ycsb.rs
+# --features "extern_ycsb rc [others]"
+rc = []
+# --features "extern_ycsb mica [others]"
+mica = []
+leveldb = []
+# --features "extern_ycsb masstree [others]"
+masstree = []
+# --features "extern_ycsb redis [others]"
+redis = []
 
 # http://doc.crates.io/manifest.html#the-%5Bprofile.*%5D-sections
 [profile.release]
@@ -33,7 +45,7 @@ opt-level = 3
 debug-assertions = false
 # lto=true debug=true -> LLVM bugs, so do not mix
 # https://github.com/rust-lang/rust/issues/34122
-debug = false
+debug = true
 lto = false
 
 [profile.bench]

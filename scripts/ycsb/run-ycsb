@@ -2,8 +2,8 @@
 set -u
 
 # not all options passed to ycsb are used (most are inherited from
-# when ycsb only ran with nibble), e.g. --put and --capacity are not
-# used when not running with Nibble, as such parameters are passed
+# when ycsb only ran with kvs), e.g. --put and --capacity are not
+# used when not running with LSM, as such parameters are passed
 # through environment variables.
 #
 # If you modify src/bin/ycsb.rs to iterate over some number of
@@ -11,29 +11,30 @@ set -u
 #
 # For MICA, don't forget to update src/common.h with the NCORES and
 # NNODES parameters and rebuild!
+#
+# LevelDB has some config options used here in db/c.cc in
+# extern_kvs_init
 
-# in MiB
-#MEMSIZE=$((128*1024))
-MEMSIZE=$((1*(1<<40)))
+# in bytes
+MEMSIZE=$((8*(1<<40)))
 # MICA doesn't use log-structured allocators for its "store mode" so
 # we needn't allocate so much space for the given keyspace
 # 64mil keys * 1000b = 64GiB
-#MEMSIZE=$((512*(1<<30)))
+#MEMSIZE=$((128*(1<<30)))
+
+NREDIS_SERVERS=64
 
 export NIBDEBUG=3
 
-export RAMCLOUD_ARGV="-t $MEMSIZE -h 10%"
+# RAMCloud accepts this value in MiB
+export RCMEM=$((MEMSIZE/1024/1024))
+export RAMCLOUD_ARGV="-t $RCMEM -h 10%"
 # number of args + 1 (like 'int argc' in C main)
 export RAMCLOUD_NARG=5
 
-# used only for RAMCloud
-#FEATURES="extern_ycsb rc"
-# used only for MICA
-#FEATURES="extern_ycsb mica"
-# used only for Nibble
-FEATURES=""
+# Choose the system (MICA, LSM, etc.) via FEATURES at bottom.
 
-# YCSB parameters
+# YCSB parameters R:W
 #  C    size=1kb  1:0  zipfian
 #  B    size=1kb 95:05 zipfian
 #  A    size=1kb 50:50 zipfian
@@ -41,13 +42,7 @@ FEATURES=""
 #
 # and we can also do uniform for each of the above
 
-size=1000
-size=100
-
-#nkeys=$((2**26))
-#size=100
-#nkeys=$((2**30))
-
+# used for changing object sizes (you can ignore)
 SHIFT=0
 
 NSOCKETS=16
@@ -56,97 +51,58 @@ NCPU=15
 # How long test core should run for.
 SEC=40
 
+# script to gather system information
+SYSINFO="../sysinfo"
+
 ######################################################################
 
-# in MiB
+source ../redis/funcs
+redis_stop
 
 capacity=$MEMSIZE
 
-## # these will be modified
+# these will be modified below
 readpct=0
+size=0
 
-read_mostly() {
+run() {
+    $SYSINFO
+
+    # NOTE NOTE
+    # Due to the larger data sets used in the evaluation,
+    # I modified bin/ycsb.rs to contain some of these loops,
+    # so they are actually irrelevant here.
+
     #for dist in uniform zipfian; do
-    for dist in uniform; do
+    for dist in zipfian; do
 
-    #for T in C B; do
-    for T in B; do
+    #for T in C B A W; do
+    for T in C; do
 
-    for fill in 30; do
+    # 12% of 8 TiB is 983 GiB
+    for fill in 12; do
 
     for size in 1000; do
 
         echo ''; echo ''
-        #echo "Fill capacity $fill %"
+        echo "Compile features $FEATURES"
+        echo "Memsize $MEMSIZE bytes; Fill capacity $fill %"
 
         # header + key + value
         objsize=$(( 4 + 8 + $size ))
         maxkeys=$(( $capacity / $objsize ))
-        #nkeys=$(( ($maxkeys * $fill) / 100 ))
-        nkeys=$((1<<26))
+
+        nkeys=$(( ($maxkeys * $fill) / 100 ))
+        #nkeys=$((1<<26))
+
         echo "objsize $objsize maxkeys $maxkeys nkeys $nkeys"
 
         [[ $T == "C" ]] && readpct=100
         [[ $T == "B" ]] && readpct=95
-        echo ''; echo ''
-        echo "# $T $dist"
-
-        # MICA environment vars. keep regardless of which KVS we use.
-        # MICA only supports one object size...
-        export MICA_VAL_LEN=$size
-        # Used for creating the hash table.. make large enough
-        export MICA_ITEMS=$((nkeys*2))
-        export MICA_CAPACITY=$capacity
-
-        cargo run --features "$FEATURES" --release --bin ycsb -- \
-            --dist $dist \
-            --readpct $readpct \
-            --records $nkeys \
-            --capacity $capacity \
-            --ops 0 \
-            --threads 1 \
-            --time $SEC \
-            --cpu incr \
-            --size $size \
-            --put local
-            #--shift $SHIFT
-        echo ''; echo ''
-
-    done
-    done
-    done
-    done
-}
-
-write_mostly() {
-    #for T in A W; do
-    for T in A; do
-
-    #for dist in uniform zipfian; do
-    for dist in uniform; do
-
-    #for fill in 30 60; do
-    for fill in 60; do
-
-    for size in 1000 100; do
-
-        echo ''; echo ''
-        echo "Fill capacity $fill %"
-
-        # header + key + value
-        objsize=$(( 4 + 8 + $size ))
-        maxkeys=$(( $capacity / $objsize ))
-        nkeys=$(( ($maxkeys * $fill) / 100 ))
-        echo "objsize $objsize maxkeys $maxkeys nkeys $nkeys"
-
-
         [[ $T == "A" ]] && readpct=50
         [[ $T == "W" ]] && readpct=0
-        [[ $T == "B" ]] && readpct=95
-
-
         echo ''; echo ''
-        echo "# $T $dist"
+        #echo "# $T $dist"
 
         # MICA environment vars. keep regardless of which KVS we use.
         # MICA only supports one object size...
@@ -166,14 +122,54 @@ write_mostly() {
             --cpu incr \
             --size $size \
             --put local \
-            --shift $SHIFT \
             --compaction
+        echo ''; echo ''
+
     done
     done
     done
     done
 }
 
-read_mostly
-#write_mostly
+##  # Other systems don't explicitly use large pages
+##  echo 'Clearing all 2 MiB page reservations...'
+##  sudo su -c 'echo 0 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages'
+
+##  FEATURES="rdrand extern_ycsb masstree"
+##  (run 2>&1) | tee -a log-masstree.out
+
+##  FEATURES="rdrand extern_ycsb rc"
+##  export RAMCLOUD_NCONTEXTS=1
+##  # OMP threads are only for speeding up the initialization
+##  export OMP_NUM_THREADS=256
+##  (run 2>&1) | tee -a log-rc-1.out
+
+##  FEATURES="rdrand extern_ycsb rc"
+##  export RAMCLOUD_NCONTEXTS=240
+##  # limit OMP to 1 thread; library spawns many, so has same effect
+##  export OMP_NUM_THREADS=1
+##  (run 2>&1) | tee -a log-rc-M.out
+
+##  FEATURES="rdrand extern_ycsb redis"
+##  redis_stop
+##  # this script dumps out some info we need...
+##  (redis_spawn $NREDIS_SERVERS 2>&1) | tee -a log-redis.out
+##  sleep 1
+##  conf=$(tail log-redis.out | grep HIREDISCONF | tail -n 1 | awk '{print $NF}')
+##  [ -e hiredis.conf ] && rm -fv hiredis.conf
+##  [ ! -e $conf ] && echo "Error: hiredis.conf not found: $conf" && exit 1
+##  # link the new conf file for hiredis
+##  ln -s -v $conf ./hiredis.conf
+##  (run 2>&1) | tee -a log-redis.out
+##  redis_stop
+
+##  # MICA and LSM need 2MiB pages
+##  echo 'Creating 2 MiB page reservations...'
+##  sudo su -c 'echo 4700000 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages'
+##  
+##  FEATURES="rdrand extern_ycsb mica"
+##  (run 2>&1) | tee -a log-mica.out
+##   
+##  FEATURES="rdrand"
+##  (run 2>&1) | tee -a log-kvs.out
 

@@ -1,0 +1,99 @@
+#! /usr/bin/env zsh
+set -u
+
+# in bytes
+# Only used by MICA and RAMCloud. To affect LSM,
+# you must modify the executable (either command argument, or a global
+# within the code itself).
+#MEMSIZE=$((2*(1<<40)))
+MEMSIZE=$((2**40 + 340*(2**30)))
+
+NKEYS=5000000000
+
+export NIBDEBUG=3
+
+# RAMCloud accepts this value in MiB
+export RCMEM=$((MEMSIZE/1024/1024))
+export RAMCLOUD_ARGV="-t $RCMEM -h 10%"
+# number of args + 1 (like 'int argc' in C main)
+export RAMCLOUD_NARG=5
+
+# Choose the system (MICA, LSM, etc.) via FEATURES at bottom.
+
+# script to gather system information
+SYSINFO="../sysinfo"
+
+######################################################################
+
+capacity=$MEMSIZE
+
+run() {
+    $SYSINFO
+
+    echo ''; echo ''
+    echo "Compile features $FEATURES"
+    echo "Memsize $MEMSIZE bytes"
+
+    # MICA environment vars. keep regardless of which KVS we use.
+    # MICA only supports one object size...
+    # FIXME is this used anymore??
+    #MICA_VAL_LEN=$size
+
+    # Use this for measuring performance of inserts (setup phase).
+    #for ((s=1;s<=15;s++)); do
+        #export TRACE_SETUP_THREADS_PER_SOCK=$s
+        #cargo run --features "$FEATURES" --release --bin trace
+    #done
+
+    # Regular trace evaluation
+    cargo run --features "$FEATURES" --release --bin trace
+
+    echo ''; echo ''
+}
+
+##  # Other systems don't explicitly use large pages
+##  echo 'Clearing all 2 MiB page reservations...'
+##  sudo su -c 'echo 0 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages'
+
+##  FEATURES="rdrand extern_ycsb masstree"
+##  (run 2>&1) | tee -a log-masstree.out
+
+##  export FEATURES="rdrand extern_ycsb rc"
+##  export RAMCLOUD_NCONTEXTS=1
+##  # OMP threads are only for speeding up the initialization
+##  export OMP_NUM_THREADS=256
+##  (run 2>&1) | tee -a log-rc-1.out
+
+##  export FEATURES="rdrand extern_ycsb rc"
+##  export RAMCLOUD_NCONTEXTS=240
+##  # limit OMP to 1 thread; library spawns many, so has same effect
+##  export OMP_NUM_THREADS=1
+##  (run 2>&1) | tee -a log-rc-M.out
+
+##  FEATURES="rdrand extern_ycsb redis"
+##  redis_stop
+##  # this script dumps out some info we need...
+##  (redis_spawn $NREDIS_SERVERS 2>&1) | tee -a log-redis.out
+##  sleep 1
+##  conf=$(tail log-redis.out | grep HIREDISCONF | tail -n 1 | awk '{print $NF}')
+##  [ -e hiredis.conf ] && rm -fv hiredis.conf
+##  [ ! -e $conf ] && echo "Error: hiredis.conf not found: $conf" && exit 1
+##  # link the new conf file for hiredis
+##  ln -s -v $conf ./hiredis.conf
+##  (run 2>&1) | tee -a log-redis.out
+##  redis_stop
+
+##  # MICA and LSM need 2MiB pages
+##  echo 'Creating 2 MiB page reservations...'
+##  sudo su -c 'echo 4700000 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages'
+##  sudo su -c 'echo 2700000 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages'
+
+##  export FEATURES="rdrand"
+##  (run 2>&1) | tee -a log-kvs.out
+
+##  # Used for creating the hash table.. make large enough
+##  export MICA_ITEMS=$((NKEYS*2))
+##  export MICA_CAPACITY=$capacity
+##  export FEATURES="rdrand extern_ycsb mica"
+##  (run 2>&1) | tee -a log-mica.out
+

@@ -4,15 +4,13 @@
 #![allow(dead_code)]
 #![feature(core_intrinsics)]
 
-/// Code ported from RAMCloud src/ClusterPerf.cc::ZipfianGenerator
-
 // NOTE XXX
 // Due to rounding errors when we insert keys in parallel during the
 // setup phase, some keys may not actually exist. It is best to
 // double check this happens infrequently; if it is infrequent, we can
 // ignore them.
 
-extern crate rand; // import before nibble
+extern crate rand; // import before kvs
 #[macro_use]
 extern crate log;
 extern crate time;
@@ -21,19 +19,21 @@ extern crate num;
 extern crate crossbeam;
 extern crate parking_lot as pl;
 
-extern crate nibble;
+extern crate kvs;
+
+use kvs::distributions::*;
 
 use clap::{Arg, App, SubCommand};
 use log::LogLevel;
-use nibble::clock;
-use nibble::common::{self,Pointer,ErrorCode,rdrand,rdrandq};
-use nibble::meta;
-use nibble::logger;
-use nibble::memory;
-use nibble::nib::{self,Nibble};
-use nibble::numa::{self,NodeId};
-use nibble::sched::*;
-use nibble::segment::{ObjDesc,SEGMENT_SIZE};
+use kvs::clock;
+use kvs::common::{self,Pointer,ErrorCode,rdrand,rdrandq};
+use kvs::meta;
+use kvs::logger;
+use kvs::memory;
+use kvs::lsm::{self,LSM};
+use kvs::numa::{self,NodeId};
+use kvs::sched::*;
+use kvs::segment::{ObjDesc,SEGMENT_SIZE};
 use rand::Rng;
 use std::collections::VecDeque;
 use std::mem;
@@ -43,49 +43,50 @@ use std::sync::atomic::*;
 use std::thread::{self,JoinHandle};
 use std::time::{Instant,Duration};
 use std::ptr;
+use std::cmp;
 
 //==----------------------------------------------------------------==
 //  Build-based functions
-//  Compile against Nibble, or exported functions.
+//  Compile against LSM, or exported functions.
 //==----------------------------------------------------------------==
 
 /// Used to create the stack-based buffers for holding GET output.
 pub const MAX_KEYSIZE: usize = 1usize << 10;
 
 //
-// Nibble redirection
+// LSM redirection
 //
 
 #[cfg(not(feature = "extern_ycsb"))]
-static mut NIBBLE: Pointer<Nibble> = Pointer(0 as *const Nibble);
+static mut KVS: Pointer<LSM> = Pointer(0 as *const LSM);
 
 #[cfg(not(feature = "extern_ycsb"))]
 fn kvs_init(config: &Config) {
-    let mut nibble =
-        Box::new(Nibble::new2(config.total, config.records*2));
-        //Box::new(Nibble::new2(config.total, 1usize<<30));
+    let mut kvs =
+        Box::new(LSM::new2(config.total, config.records*2));
+        //Box::new(LSM::new2(config.total, 1usize<<30));
     if config.comp {
         info!("Enabling compaction");
         for node in 0..numa::NODE_MAP.sockets() {
-            nibble.enable_compaction(NodeId(node));
+            kvs.enable_compaction(NodeId(node));
         }
     } else {
         warn!("Compaction NOT enabled");
     }
     unsafe {
-        let p = Box::into_raw(nibble);
-        NIBBLE = Pointer(p);
+        let p = Box::into_raw(kvs);
+        KVS = Pointer(p);
     }
 }
 
 #[inline(always)]
 #[cfg(not(feature = "extern_ycsb"))]
 fn put_object(key: u64, value: Pointer<u8>, len: usize, sock: usize) {
-    let nibble: &Nibble = unsafe { &*NIBBLE.0 };
+    let kvs: &LSM = unsafe { &*KVS.0 };
     let obj = ObjDesc::new(key, value, len);
-    let nibnode = nib::PutPolicy::Specific(sock);
+    let nibnode = lsm::PutPolicy::Specific(sock);
     loop {
-        let err = nibble.put_where(&obj, nibnode);
+        let err = kvs.put_where(&obj, nibnode);
         if err.is_err() {
             match err {
                 Err(ErrorCode::OutOfMemory) => continue,
@@ -103,11 +104,11 @@ fn put_object(key: u64, value: Pointer<u8>, len: usize, sock: usize) {
 #[inline(always)]
 #[cfg(not(feature = "extern_ycsb"))]
 fn get_object(key: u64) {
-    let nibble: &Nibble = unsafe { &*NIBBLE.0 };
+    let kvs: &LSM = unsafe { &*KVS.0 };
     let mut buf: [u8;MAX_KEYSIZE] =
         unsafe { mem::uninitialized() };
-    let _ = nibble.get_object(key, &mut buf);
-    //if let Err(e) = nibble.get_object(key, &mut buf) {
+    let _ = kvs.get_object(key, &mut buf);
+    //if let Err(e) = kvs.get_object(key, &mut buf) {
         //warn!("{:?} {:x}", e, key);
         //unsafe { intrinsics::abort(); }
     //}
@@ -147,6 +148,32 @@ extern {
     fn extern_kvs_get(key: u64);
 }
 
+// Link against libhiredis.so which is built from
+// https://github.gatech.edu/kernel/hiredis.git
+#[link(name = "hiredisext")]
+#[cfg(feature = "redis")]
+#[cfg(feature = "extern_ycsb")]
+extern {
+    // must match signatures in hiredis.c
+    fn extern_kvs_init();
+    fn extern_kvs_put(key: u64, len: u64, buf: *const u8);
+    fn extern_kvs_del(key: u64);
+    fn extern_kvs_get(key: u64);
+}
+
+// Link against libmasstree.so which is built from
+// https://github.gatech.edu/kernel/masstree.git
+#[link(name = "masstree")]
+#[cfg(feature = "masstree")]
+#[cfg(feature = "extern_ycsb")]
+extern {
+    // must match signatures in libmasstree.cc
+    fn extern_kvs_init();
+    fn extern_kvs_put(key: u64, len: u64, buf: *const u8);
+    fn extern_kvs_del(key: u64);
+    fn extern_kvs_get(key: u64);
+}
+
 #[cfg(feature = "extern_ycsb")]
 fn kvs_init(config: &Config) {
     unsafe {
@@ -154,7 +181,9 @@ fn kvs_init(config: &Config) {
     }
 }
 
-#[cfg(feature = "rc")]
+// method interface is the same for RAMCloud and LevelDB's hacks
+// so we reuse it.
+#[cfg(any(feature = "rc", feature = "redis", feature = "masstree"))]
 #[cfg(feature = "extern_ycsb")]
 fn put_object(key: u64, value: Pointer<u8>, len: usize, sock: usize) {
     // we ignore 'sock' b/c RAMCloud is NUMA-agnostic
@@ -165,7 +194,7 @@ fn put_object(key: u64, value: Pointer<u8>, len: usize, sock: usize) {
     }
 }
 
-#[cfg(feature = "rc")]
+#[cfg(any(feature = "rc", feature = "redis", feature = "masstree"))]
 #[cfg(feature = "extern_ycsb")]
 fn get_object(key: u64) {
     unsafe {
@@ -174,7 +203,7 @@ fn get_object(key: u64) {
     }
 }
 
-#[cfg(feature = "rc")]
+#[cfg(any(feature = "rc", feature = "redis", feature = "masstree"))]
 #[cfg(feature = "extern_ycsb")]
 fn del_object(key: u64) {
     unsafe {
@@ -200,9 +229,9 @@ fn put_object(key: u64, value: Pointer<u8>, len: usize, sock: usize) {
                 match r {
                     111 => println!("MICA failed to insert in table"),
                     112 => println!("MICA failed to insert in heap"),
-                    _ => prinltn!("MICA failed with unknown: {}", ret),
+                    _ => println!("MICA failed with unknown: {}", ret),
                 }
-                unsafe { intrinsics::abort(); }
+                //unsafe { intrinsics::abort(); }
             },
         }
     }
@@ -215,7 +244,7 @@ fn get_object(key: u64) {
         trace!("GET {:x}", key);
         if !extern_kvs_get(key) {
             println!("GET failed on key 0x{:x}", key);
-            unsafe { intrinsics::abort(); }
+            //unsafe { intrinsics::abort(); }
         }
         //assert!( extern_kvs_get(key),
             //"GET failed on key 0x{:x}", key);
@@ -239,170 +268,6 @@ fn del_object(key: u64) {
 //==----------------------------------------------------------------==
 //  The rest of the benchmark
 //==----------------------------------------------------------------==
-
-trait DistGenerator {
-    fn next(&mut self) -> u32;
-    fn reset(&mut self);
-}
-
-#[derive(Debug,Clone,Copy)]
-struct Zipfian {
-    n: u32,
-    theta: f64,
-    alpha: f64,
-    zetan: f64,
-    eta: f64,
-}
-
-impl Zipfian {
-
-    pub fn new(n: u32, s: f64) -> Self {
-        let theta: f64 = s;
-        let zetan: f64 = Self::zeta(n as u64, theta);
-        Zipfian {
-            n: n, theta: theta,
-            alpha: 1f64 / (1f64 - theta),
-            zetan: zetan,
-            eta: (1f64 - (2f64 / (n as f64)).powf(1f64-theta)) /
-                (1f64 - Self::zeta(2u64, theta) / zetan),
-        }
-    }
-
-    /// Compute H(N,s), the generalized Nth harmonic number
-    pub fn zeta(n: u64, theta: f64) -> f64 {
-        let mut sum: f64 = 0f64;
-        for x in 0u64..n {
-            sum += 1f64 / ((x+1) as f64).powf(theta);
-        }
-        sum
-    }
-}
-
-impl DistGenerator for Zipfian {
-
-    #[inline(always)]
-    fn next(&mut self) -> u32 {
-        let u: f64 = unsafe { rdrandq() as f64 } / 
-            (std::u32::MAX as f64);
-        let uz: f64 = u * self.zetan;
-        if uz < 1f64 { 0u32 }
-        else if uz < (1f64 + 0.5f64.powf(self.theta)) { 1u32 }
-        else {
-            ((self.eta*u - self.eta + 1f64).powf(self.alpha)
-             * (self.n as f64)) as u32
-        }
-    }
-    fn reset(&mut self) { }
-}
-
-struct ZipfianArray {
-    n: u32,
-    /// Given we execute for short periods in our experiments, we
-    /// won't need to generate all data points. 'n' is the total
-    /// quantity of items we would access given infinite time. 'upto'
-    /// is how many operations we'll realistically perform given the
-    /// duration of the experiment.
-    upto: Option<u32>,
-    arr: Vec<u32>,
-    next: u32,
-}
-
-impl ZipfianArray {
-
-    pub fn new(n: u32, s: f64) -> Self {
-        let many = (n*4) as usize;
-        let mut v: Vec<u32> = Vec::with_capacity(many);
-        let mut zip = Zipfian::new(n, s);
-        for _ in 0..many {
-            v.push(zip.next());
-        }
-        // Knuth shuffle
-        for i in 0..many {
-            let r = unsafe { rdrand() };
-            let o = (r as usize % (many-i)) + i;
-            v.swap(i as usize, o as usize);
-        }
-        ZipfianArray { n: n, upto: None, arr: v, next: 0 }
-    }
-
-    pub fn new_capped(n: u32, s: f64, upto: u32) -> Self {
-        let mut v: Vec<u32> = Vec::with_capacity(upto as usize);
-        let mut zip = Zipfian::new(n, s);
-        for _ in 0..upto {
-            v.push(zip.next());
-        }
-        // Knuth shuffle
-        for i in 0..upto {
-            let r = unsafe { rdrand() };
-            let o = (r % (upto-i)) + i;
-            v.swap(i as usize, o as usize);
-        }
-        ZipfianArray { n: n, upto: Some(upto), arr: v, next: 0 }
-    }
-}
-
-impl DistGenerator for ZipfianArray {
-
-    #[inline(always)]
-    fn next(&mut self) -> u32 {
-        self.next = (self.next + 1) % self.n;
-        if self.upto.is_some() {
-            assert!(self.next < self.upto.unwrap(),
-                    "upto exceeded. increase, or shorten expmt duration");
-        }
-        self.arr[self.next as usize] as u32
-    }
-    fn reset(&mut self) {
-        self.next = 0;
-    }
-}
-
-struct Uniform {
-    n: u32,
-    arr: Vec<u32>,
-    next: u32,
-}
-
-impl Uniform {
-
-    /// don't pre-compute values; use rdrand
-    pub fn new(n: u32) -> Self {
-        let mut v = vec![];
-        Uniform { n: n, arr: v, next: 0 }
-    }
-
-    /// use pre-computed array of values
-    #[cfg(IGNORE)]
-    pub fn new(n: u32) -> Self {
-        let mut v: Vec<u32> = Vec::with_capacity(n as usize);
-        for x in 0..n {
-            v.push(x as u32);
-        }
-        common::shuffle(&mut v);
-        Uniform { n: n, arr: v, next: 0 }
-    }
-}
-
-impl DistGenerator for Uniform {
-
-    /// don't pre-compute values; use rdrand
-    #[inline(always)]
-    fn next(&mut self) -> u32 {
-        (unsafe { rdrand() } % (self.n+1)) as u32
-    }
-
-    /// use pre-computed array of values
-    #[cfg(IGNORE)]
-    #[inline(always)]
-    fn next(&mut self) -> u32 {
-        self.next = (self.next + 1) % self.n;
-        self.arr[self.next as usize]
-    }
-
-    fn reset(&mut self) {
-        self.next = 0;
-    }
-}
 
 #[derive(Debug,Clone,Copy)]
 enum YCSB {
@@ -482,14 +347,14 @@ impl WorkloadGenerator {
     }
 
     // sequential insertion (ramcloud)
-    #[cfg(feature = "rc")]
+    #[cfg(any(feature = "rc"))]
     #[cfg(feature = "extern_ycsb")]
     pub fn setup(&mut self) {
         self.__setup(false);
     }
 
-    // parallel insertion (nibble, mica)
-    #[cfg(any(feature = "mica", not(feature = "extern_ycsb")))]
+    // parallel insertion (kvs, mica, others..)
+    #[cfg(any(feature = "mica", feature="redis", feature = "masstree", not(feature = "extern_ycsb")))]
     pub fn setup(&mut self) {
         self.__setup(true);
     }
@@ -533,7 +398,7 @@ impl WorkloadGenerator {
 
         //threadcount = vec![self.config.threads];
         // specific number of threads only
-        threadcount = vec![240];
+        //threadcount = vec![240];
         // max number of threads
         //threadcount = vec![cpus_pernode*sockets];
         // power of 2   1, 2, 4, 8, 16, 32, 64, 128, 256
@@ -545,8 +410,8 @@ impl WorkloadGenerator {
         // incr of 1    1, 2, 3, 4, 5, ...
         //threadcount = (1usize..261).collect();
         // incr of x    where x= cpus/socket
-        //threadcount = (1_usize..(sockets+1))
-            //.map(|e|cpus_pernode*e).collect();
+        threadcount = (1_usize..(sockets+1))
+            .map(|e|cpus_pernode*e).collect();
         info!("thread counts to use: {:?}", threadcount);
         let max_threads: usize = *threadcount.last().unwrap() as usize;
 
@@ -584,10 +449,8 @@ impl WorkloadGenerator {
                     let item: Box<DistGenerator>;
                     item = match self.config.dist {
                         Dist::Zipfian(s) =>
-                            Box::new(ZipfianArray::new_capped(
-                                self.config.records as u32, s,
-                                (self.config.dur as f64*(2f64*4e6)) as u32
-                                )),
+                            Box::new(Zipfian::new(
+                                self.config.records as u32, s)),
                         Dist::Uniform => {
                             let n = self.config.records as u32;
                             Box::new( Uniform::new(n) )
@@ -640,7 +503,7 @@ impl WorkloadGenerator {
                 CPUPolicy::SocketRR => {
                     for i in 0..cpus_pernode {
                         for sock in 0..sockets {
-                            let r = numa::NODE_MAP.cpus_of(NodeId(sock)).get( );
+                            let r = numa::NODE_MAP.cpus_of(NodeId(sock)).get();
                             cpus.push_back(r[i]);
                         }
                     }
@@ -837,7 +700,7 @@ fn extract_puts(args: &clap::ArgMatches) -> PutPolicy {
 // TODO: setup configuration, how to allocate objects across sockets
 #[derive(Debug,Clone,Copy)]
 struct Config {
-    /// Amount of memory to use for nibble
+    /// Amount of memory to use for kvs
     total: usize,
     /// if None, custom workload
     ycsb: Option<YCSB>,
@@ -1039,7 +902,26 @@ fn main() {
     // or user-defined if you omit --ycsb
     // --records --size --readpct --dist --capacity --ops
 
+    println!("NOTE -- THIS CODE VERSION IGNORES MANY CMD PARAMS");
+
     let mut gen = WorkloadGenerator::new(config);
     gen.setup();
-    gen.run();
+
+    // filling the db takes a long time (20-60 minutes!)
+    // so we reuse it across runs
+    let dists: Vec<Dist> = vec![Dist::Uniform, Dist::Zipfian(0.99)];
+    //let dists: Vec<Dist> = vec![Dist::Uniform];
+
+    let readpct: Vec<usize> = vec![100,95,50,0];
+    //let readpct: Vec<usize> = vec![100];
+
+    for d in &dists {
+        gen.config.dist = *d;
+        info!("Distribution: {:?}", d);
+        for r in &readpct {
+            info!("Read PCT: {:?}", r);
+            gen.config.read_pct = *r;
+            gen.run();
+        }
+    }
 }
